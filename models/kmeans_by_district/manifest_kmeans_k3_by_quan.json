@@ -1,0 +1,23 @@
+[
+  {
+    "quan":"Binh Thanh",
+    "model_file":"models\\kmeans_by_district\\kmeans_k3_binh_thanh.joblib",
+    "n_samples":2245,
+    "silhouette":0.2918716028,
+    "cluster_label_map":"{\"0\": \"nhà cao cấp\", \"1\": \"nhà cận cao cấp\", \"2\": \"nhà bình dân\"}"
+  },
+  {
+    "quan":"Go Vap",
+    "model_file":"models\\kmeans_by_district\\kmeans_k3_go_vap.joblib",
+    "n_samples":3783,
+    "silhouette":0.2881578776,
+    "cluster_label_map":"{\"0\": \"nhà cao cấp\", \"1\": \"nhà cận cao cấp\", \"2\": \"nhà bình dân\"}"
+  },
+  {
+    "quan":"Phu Nhuan",
+    "model_file":"models\\kmeans_by_district\\kmeans_k3_phu_nhuan.joblib",
+    "n_samples":1090,
+    "silhouette":0.2508637793,
+    "cluster_label_map":"{\"0\": \"nhà cao cấp\", \"1\": \"nhà cận cao cấp\", \"2\": \"nhà bình dân\"}"
+  }
+]

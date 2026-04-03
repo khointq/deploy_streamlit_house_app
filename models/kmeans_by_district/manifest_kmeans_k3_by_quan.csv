@@ -1,0 +1,4 @@
+﻿quan,model_file,n_samples,silhouette,cluster_label_map
+Binh Thanh,models\kmeans_by_district\kmeans_k3_binh_thanh.joblib,2245,0.2918716027844025,"{""0"": ""nhà cao cấp"", ""1"": ""nhà cận cao cấp"", ""2"": ""nhà bình dân""}"
+Go Vap,models\kmeans_by_district\kmeans_k3_go_vap.joblib,3783,0.28815787757163336,"{""0"": ""nhà cao cấp"", ""1"": ""nhà cận cao cấp"", ""2"": ""nhà bình dân""}"
+Phu Nhuan,models\kmeans_by_district\kmeans_k3_phu_nhuan.joblib,1090,0.250863779272012,"{""0"": ""nhà cao cấp"", ""1"": ""nhà cận cao cấp"", ""2"": ""nhà bình dân""}"
