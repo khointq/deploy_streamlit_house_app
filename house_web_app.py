@@ -250,6 +250,7 @@ def save_uploaded_data(df: pd.DataFrame) -> None:
     df.to_csv(DATA_PATH, index=False)
     load_data.clear()
     build_hybrid_matrices.clear()
+    build_house_index_lookup.clear()
 
 
 def save_admin_posts(df_admin: pd.DataFrame) -> None:
@@ -631,6 +632,29 @@ def clean_text(s: str) -> str:
     return s
 
 
+def normalize_house_key_value(v: object) -> str:
+    return str(v or "").strip().lower()
+
+
+def make_house_key(title: object, address: object) -> tuple[str, str]:
+    return normalize_house_key_value(title), normalize_house_key_value(address)
+
+
+@st.cache_data(ttl=600)
+def build_house_index_lookup() -> dict[tuple[str, str], int]:
+    """Tạo lookup (title, address) -> index để điều hướng nhanh khi xem chi tiết."""
+    df = load_data()
+    if df.empty:
+        return {}
+
+    lookup: dict[tuple[str, str], int] = {}
+    for idx, row in df.iterrows():
+        key = make_house_key(row.get("tieu_de", ""), row.get("dia_chi", ""))
+        if key not in lookup:
+            lookup[key] = int(idx)
+    return lookup
+
+
 @st.cache_data(ttl=3600)
 def build_tfidf_full(df_hash: int):
     """Xây TF-IDF cho toàn bộ catalog, dùng cho các tác vụ offline nếu cần.
@@ -669,14 +693,14 @@ def build_tfidf_full(df_hash: int):
     return tfidf, X
 
 
-@st.cache_data(ttl=3600)
+@st.cache_resource
 def build_hybrid_matrices():
-    """Tiền tính các ma trận similarity cho Hybrid Recommendation."""
+    """Tiền xử lý feature cho Hybrid Recommendation (nhẹ bộ nhớ, phù hợp cloud)."""
     df = load_data()
     if df.empty:
-        return None, None, None
+        return None
 
-    # 1) Content similarity (TF‑IDF + cosine)
+    # 1) Content feature (TF‑IDF sparse)
     text_cols = [
         "tieu_de",
         "dia_chi",
@@ -694,7 +718,7 @@ def build_hybrid_matrices():
         combined_text.append(clean_text(" ".join(parts)))
 
     if not any(combined_text):
-        return None, None, None
+        return None
 
     tfidf = TfidfVectorizer(
         min_df=2,
@@ -703,29 +727,21 @@ def build_hybrid_matrices():
         max_features=10000,
     )
     X_text = tfidf.fit_transform(combined_text)
-    content_sim = cosine_similarity(X_text, dense_output=False).toarray().astype(float)
 
-    # 2) Price similarity
+    # 2) Price feature (min-max)
     price = pd.to_numeric(df.get("gia_ban_num", 0), errors="coerce").fillna(0).values.astype(float)
     price_scaled = (price - price.min()) / (price.max() - price.min() + 1e-9)
-    price_dist = np.abs(price_scaled[:, None] - price_scaled[None, :])
-    price_sim = 1.0 / (1.0 + price_dist)
 
-    # 3) Location similarity (quận)
-    quan_ohe = pd.get_dummies(df.get("quan", "unknown").fillna("unknown").astype(str), dtype=float).values
-    location_dist = np.linalg.norm(quan_ohe[:, None, :] - quan_ohe[None, :, :], axis=2)
-    location_sim = 1.0 / (1.0 + location_dist)
+    # 3) Location feature (mã quận)
+    quan_series = df.get("quan", pd.Series(["unknown"] * len(df))).fillna("unknown").astype(str)
+    quan_codes = pd.factorize(quan_series, sort=True)[0]
 
-    def minmax_norm(m: np.ndarray) -> np.ndarray:
-        row_min = m.min(axis=1, keepdims=True)
-        row_max = m.max(axis=1, keepdims=True)
-        return (m - row_min) / (row_max - row_min + 1e-9)
-
-    content_sim_n = minmax_norm(content_sim)
-    price_sim_n = minmax_norm(price_sim)
-    location_sim_n = minmax_norm(location_sim)
-
-    return content_sim_n, price_sim_n, location_sim_n
+    return {
+        "X_text": X_text,
+        "price_scaled": price_scaled,
+        "quan_codes": quan_codes,
+        "n_items": len(df),
+    }
 
 
 def recommend_content_based(query_text: str, df: pd.DataFrame, top_k: int = 5) -> pd.DataFrame:
@@ -799,28 +815,90 @@ def recommend_hybrid(
     if df is None or df.empty or item_idx < 0 or item_idx >= len(df):
         return pd.DataFrame()
 
-    # Ma trận hybrid được cache theo toàn bộ dataset, tránh tính toán lại mỗi lần xem chi tiết
-    matrices = build_hybrid_matrices()
-    if any(m is None for m in matrices):
+    # Dùng feature cache thay vì full NxN matrix để tránh chậm và lỗi bộ nhớ trên cloud
+    features = build_hybrid_matrices()
+    if features is None:
         return pd.DataFrame()
 
-    content_sim_n, price_sim_n, location_sim_n = matrices
+    X_text = features.get("X_text")
+    price_scaled = features.get("price_scaled")
+    quan_codes = features.get("quan_codes")
+    n_items = int(features.get("n_items", 0))
+
+    if X_text is None or price_scaled is None or quan_codes is None or n_items != len(df):
+        return pd.DataFrame()
+
+    if n_items <= 1:
+        return pd.DataFrame()
+
+    # Chỉ lấy tập ứng viên gần nhất theo giá + ưu tiên cùng quận để giảm compute mạnh trên dữ liệu lớn
+    all_idx = np.arange(n_items)
+    not_self = all_idx != item_idx
+    base_candidates = all_idx[not_self]
+
+    same_quan_mask = quan_codes[base_candidates] == quan_codes[item_idx]
+    same_quan_idx = base_candidates[same_quan_mask]
+
+    target_candidate_size = min(max(500, top_k * 120), n_items - 1)
+
+    if same_quan_idx.size >= top_k:
+        candidate_pool = same_quan_idx
+    else:
+        candidate_pool = base_candidates
+
+    if candidate_pool.size > target_candidate_size:
+        pool_price_dist = np.abs(price_scaled[candidate_pool] - price_scaled[item_idx])
+        keep_pos = np.argpartition(pool_price_dist, target_candidate_size - 1)[:target_candidate_size]
+        candidate_idx = candidate_pool[keep_pos]
+    else:
+        candidate_idx = candidate_pool
+
+    if candidate_idx.size == 0:
+        return pd.DataFrame()
+
+    # Content similarity chỉ trên ứng viên (không full N)
+    content_sim = cosine_similarity(X_text[item_idx], X_text[candidate_idx]).ravel().astype(float)
+
+    # Price similarity theo vector ứng viên
+    price_dist = np.abs(price_scaled[item_idx] - price_scaled[candidate_idx])
+    price_sim = 1.0 / (1.0 + price_dist)
+
+    # Location similarity: cùng quận = 1, khác quận ~ 1/(1+sqrt(2))
+    same_quan = (quan_codes[candidate_idx] == quan_codes[item_idx]).astype(float)
+    location_sim = np.where(same_quan > 0.5, 1.0, 1.0 / (1.0 + np.sqrt(2.0)))
+
+    def minmax_norm_1d(v: np.ndarray) -> np.ndarray:
+        vmin = float(np.min(v))
+        vmax = float(np.max(v))
+        return (v - vmin) / (vmax - vmin + 1e-9)
+
+    content_sim_n = minmax_norm_1d(content_sim)
+    price_sim_n = minmax_norm_1d(price_sim)
+    location_sim_n = minmax_norm_1d(location_sim)
 
     scores = (
-        w_content * content_sim_n[item_idx]
-        + w_price * price_sim_n[item_idx]
-        + w_location * location_sim_n[item_idx]
+        w_content * content_sim_n
+        + w_price * price_sim_n
+        + w_location * location_sim_n
     )
-    scores[item_idx] = -1.0
 
-    k = min(top_k, len(df))
-    top_idx = np.argsort(scores)[::-1][:k]
+    k = min(top_k, candidate_idx.size)
+    if k <= 0:
+        return pd.DataFrame()
+
+    if candidate_idx.size > k:
+        top_pos = np.argpartition(scores, -k)[-k:]
+        top_pos = top_pos[np.argsort(scores[top_pos])[::-1]]
+    else:
+        top_pos = np.argsort(scores)[::-1]
+
+    top_idx = candidate_idx[top_pos]
 
     out = df.iloc[top_idx].copy()
-    out["score_hybrid"] = scores[top_idx]
-    out["score_content"] = content_sim_n[item_idx, top_idx]
-    out["score_price"] = price_sim_n[item_idx, top_idx]
-    out["score_location"] = location_sim_n[item_idx, top_idx]
+    out["score_hybrid"] = scores[top_pos]
+    out["score_content"] = content_sim_n[top_pos]
+    out["score_price"] = price_sim_n[top_pos]
+    out["score_location"] = location_sim_n[top_pos]
 
     return out.reset_index(drop=True)
 
@@ -1178,6 +1256,7 @@ def buyer_interface() -> None:
     if base_df.empty:
         st.warning("Chưa có dữ liệu nhà nào.")
         return
+    house_lookup = build_house_index_lookup()
 
     st.markdown("<div class='section-title'>🔎 Tìm kiếm nâng cao</div>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns(3)
@@ -1239,21 +1318,6 @@ def buyer_interface() -> None:
             st.warning("Không tìm thấy căn nhà phù hợp với nội dung mô tả.")
             return
 
-        st.subheader("Kết quả đề xuất theo nội dung")
-        show_cols = [
-            c
-            for c in [
-                "tieu_de",
-                "quan",
-                "loai_hinh",
-                "gia_ban_num",
-                "dien_tich_num",
-                "score_content",
-            ]
-            if c in rec_df.columns
-        ]
-        st.dataframe(rec_df[show_cols].head(LIST_PAGE_SIZE), use_container_width=True)
-
         # Dùng danh sách đề xuất làm danh sách hiển thị
         df = rec_df.drop(columns=["score_content"], errors="ignore")
 
@@ -1294,18 +1358,12 @@ def buyer_interface() -> None:
             with top_right:
                 st.markdown("<div style='height:0.15rem'></div>", unsafe_allow_html=True)
                 if st.button("Xem chi tiết", key=f"house_btn_{idx}"):
-                    # Tìm index tương ứng trong toàn bộ dataframe để dùng cho hybrid
-                    mask = (
-                        base_df["tieu_de"].fillna("").astype(str).str.strip()
-                        == str(row.get("tieu_de", "")).strip()
-                    ) & (
-                        base_df["dia_chi"].fillna("").astype(str).str.strip()
-                        == str(row.get("dia_chi", "")).strip()
-                    )
-                    match_idx = base_df.index[mask].tolist()
+                    # Tìm index nhanh bằng lookup cache
+                    match_key = make_house_key(row.get("tieu_de", ""), row.get("dia_chi", ""))
+                    match_idx = house_lookup.get(match_key)
 
                     st.session_state["selected_house"] = row_dict
-                    st.session_state["selected_house_idx"] = match_idx[0] if match_idx else None
+                    st.session_state["selected_house_idx"] = int(match_idx) if match_idx is not None else None
                     st.session_state["page"] = "house_details"
                     st.rerun()
 
@@ -1341,6 +1399,7 @@ def house_details_interface() -> None:
 
     house = st.session_state["selected_house"]
     house["phan_khuc_du_doan"] = resolve_segment_for_display(house)
+    house_lookup = build_house_index_lookup()
 
     left_col, right_col = st.columns([1.05, 1], gap="large")
 
@@ -1400,17 +1459,11 @@ def house_details_interface() -> None:
                             with action_col:
                                 if st.button("Chi tiết", key=f"rec_detail_{ridx}", type="secondary"):
                                     # Cập nhật nhà được chọn và index rồi render lại trang chi tiết
-                                    mask = (
-                                        df["tieu_de"].fillna("").astype(str).str.strip()
-                                        == str(r.get("tieu_de", "")).strip()
-                                    ) & (
-                                        df["dia_chi"].fillna("").astype(str).str.strip()
-                                        == str(r.get("dia_chi", "")).strip()
-                                    )
-                                    match_idx = df.index[mask].tolist()
+                                    match_key = make_house_key(r.get("tieu_de", ""), r.get("dia_chi", ""))
+                                    match_idx = house_lookup.get(match_key)
 
                                     st.session_state["selected_house"] = r.to_dict()
-                                    st.session_state["selected_house_idx"] = match_idx[0] if match_idx else None
+                                    st.session_state["selected_house_idx"] = int(match_idx) if match_idx is not None else None
                                     st.rerun()
 
 
